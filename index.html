@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Random Indiana Coordinate — No libs</title>
+<style>
+  html,body { height:100%; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial; }
+  #map { position:relative; width:100%; height:calc(100% - 72px); background:#e5e3df; overflow:hidden; touch-action:none; }
+  #ui { height:72px; display:flex; gap:12px; align-items:center; padding:10px; box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  button { padding:10px 14px; border-radius:8px; border:1px solid #ccc; background:white; cursor:pointer; }
+  #info { font-size:14px; color:#333; }
+  .tile { position:absolute; width:256px; height:256px; image-rendering:crisp-edges; }
+  .marker {
+    position:absolute;
+    width:18px;height:18px;margin-left:-9px;margin-top:-18px;
+    pointer-events:none;
+    transform-origin:center bottom;
+  }
+  .marker svg { width:100%; height:100%; }
+  #loading { position:absolute; right:8px; top:8px; background:rgba(255,255,255,0.9); padding:6px 8px; border-radius:6px; font-size:13px; box-shadow:0 1px 3px rgba(0,0,0,0.1); }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <button id="randBtn">Pick random point in Indiana</button>
+    <button id="fitBtn">Fit Indiana</button>
+    <div id="info">Zoom/pan: drag or scroll. Uses OpenStreetMap tiles & Indiana GeoJSON.</div>
+  </div>
+  <div id="map">
+    <div id="loading">loading boundary…</div>
+  </div>
+
+<script>
+/*
+  Minimal map implementation (no libraries)
+  - uses WebMercator (EPSG:3857) / OSM XYZ tile urls
+  - simple tile loader, pan (drag), wheel zoom
+  - fetches Indiana GeoJSON from Indiana ArcGIS FeatureServer
+  - rejection sample within bbox and test point-in-polygon
+*/
+
+// --- Config ---
+const TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"; // light use only; see OSM tile policy
+const TILE_SIZE = 256;
+const MAX_REJECTION_ATTEMPTS = 5000;
+const INDIANA_GEOJSON_URL = "https://gisdata.in.gov/server/rest/services/Hosted/Indiana_Boundary_USCB_2020/FeatureServer/0/query?where=1%3D1&outFields=&outSR=4326&f=geojson";
+
+// --- Map state ---
+const mapEl = document.getElementById('map');
+let center = { lat: 39.7684, lon: -86.1581 }; // Indianapolis center initial
+let zoom = 7; // integer zoom for simplicity (we allow fractional via scale)
+let offset = { x: 0, y: 0 }; // pixel offset for panning
+let tileContainer = document.createElement('div'); tileContainer.style.position='absolute'; mapEl.appendChild(tileContainer);
+let markerEl = null;
+let indianaPolygon = null; // GeoJSON polygon (or MultiPolygon)
+const loadingEl = document.getElementById('loading');
+
+function setLoading(v, txt) {
+  loadingEl.style.display = v ? 'block' : 'none';
+  if (txt) loadingEl.textContent = txt;
+}
+
+// --- Projection helpers ---
+function lon2tileX(lon, z) {
+  return (lon + 180) / 360 * Math.pow(2, z);
+}
+function lat2tileY(lat, z) {
+  const rad = lat * Math.PI/180;
+  return (1 - Math.log(Math.tan(rad) + 1/Math.cos(rad)) / Math.PI) / 2 * Math.pow(2, z);
+}
+function tileX2lon(x,z) { return x / Math.pow(2,z) * 360 - 180; }
+function tileY2lat(y,z) {
+  const n = Math.PI - 2 * Math.PI * y / Math.pow(2,z);
+  return (180/Math.PI) * Math.atan(0.5*(Math.exp(n)-Math.exp(-n)));
+}
+function latLonToPixel(lat, lon, z) {
+  const x = lon2tileX(lon, z) * TILE_SIZE;
+  const y = lat2tileY(lat, z) * TILE_SIZE;
+  return { x, y };
+}
+function pixelToLatLon(px, py, z) {
+  const tx = px / TILE_SIZE;
+  const ty = py / TILE_SIZE;
+  const lon = tileX2lon(tx, z);
+  const lat = tileY2lat(ty, z);
+  return { lat, lon };
+}
+
+// --- Tile rendering ---
+let lastRenderKey = "";
+function renderTiles() {
+  const w = mapEl.clientWidth, h = mapEl.clientHeight;
+  const centerPx = latLonToPixel(center.lat, center.lon, zoom);
+  const originX = centerPx.x - w/2 + offset.x;
+  const originY = centerPx.y - h/2 + offset.y;
+  // visible tile range
+  const x0 = Math.floor(originX / TILE_SIZE);
+  const y0 = Math.floor(originY / TILE_SIZE);
+  const x1 = Math.floor((originX + w) / TILE_SIZE);
+  const y1 = Math.floor((originY + h) / TILE_SIZE);
+  const key = `${zoom}_${x0}_${y0}_${x1}_${y1}`;
+  if (key === lastRenderKey) return; // small optimization
+  lastRenderKey = key;
+  tileContainer.innerHTML = ''; // remove old tiles
+  for (let tx = x0; tx <= x1; tx++) {
+    for (let ty = y0; ty <= y1; ty++) {
+      const img = document.createElement('img');
+      img.className = 'tile';
+      img.style.left = (tx * TILE_SIZE - originX) + 'px';
+      img.style.top  = (ty * TILE_SIZE - originY) + 'px';
+      img.width = TILE_SIZE; img.height = TILE_SIZE;
+      const maxTile = Math.pow(2, Math.round(zoom));
+      // wrap X (world)
+      let wrapX = ((tx % maxTile) + maxTile) % maxTile;
+      const url = TILE_URL.replace('{z}', Math.round(zoom)).replace('{x}', wrapX).replace('{y}', ty);
+      img.src = url;
+      img.onerror = () => { img.style.opacity = 0.5; };
+      tileContainer.appendChild(img);
+    }
+  }
+  // re-position marker if present
+  if (markerEl && markerEl.dataset.lat) {
+    placeMarker(Number(markerEl.dataset.lat), Number(markerEl.dataset.lon));
+  }
+}
+
+// --- Pan & zoom ---
+let dragging = false, lastPointer = null;
+mapEl.addEventListener('pointerdown', (e) => {
+  dragging = true; mapEl.setPointerCapture(e.pointerId);
+  lastPointer = { x: e.clientX, y: e.clientY };
+});
+mapEl.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  const dx = e.clientX - lastPointer.x, dy = e.clientY - lastPointer.y;
+  offset.x += dx; offset.y += dy;
+  lastPointer = { x: e.clientX, y: e.clientY };
+  renderTiles();
+});
+mapEl.addEventListener('pointerup', (e) => {
+  dragging = false; mapEl.releasePointerCapture(e.pointerId);
+});
+// wheel zoom (centered on viewport center)
+mapEl.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const delta = Math.sign(e.deltaY);
+  const newZoom = Math.max(1, Math.min(18, Math.round(zoom - delta)));
+  if (newZoom === Math.round(zoom)) return;
+  // keep center stable in world pixel coords
+  const w = mapEl.clientWidth, h = mapEl.clientHeight;
+  const before = latLonToPixel(center.lat, center.lon, zoom);
+  const cx = before.x - (offset.x + w/2);
+  const cy = before.y - (offset.y + h/2);
+  const scale = Math.pow(2, newZoom - zoom);
+  // new center pixel = before scaled, adjust offset accordingly
+  const newCenterPx = { x: before.x * scale, y: before.y * scale };
+  // reset offset so visual position similar
+  offset.x = newCenterPx.x - w/2 - cx*scale;
+  offset.y = newCenterPx.y - h/2 - cy*scale;
+  zoom = newZoom;
+  renderTiles();
+}, { passive:false });
+
+// on resize re-render
+window.addEventListener('resize', () => { renderTiles(); });
+
+// --- Marker helpers ---
+function createMarker() {
+  if (markerEl) markerEl.remove();
+  markerEl = document.createElement('div');
+  markerEl.className = 'marker';
+  markerEl.innerHTML = `
+    <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path d="M12 2.5C8.4 2.5 5.5 5.4 5.5 9c0 5.25 6.5 11.25 6.5 11.25S18.5 14.25 18.5 9c0-3.6-2.9-6.5-6.5-6.5z" fill="#d33"/>
+      <circle cx="12" cy="9" r="2.2" fill="white"/>
+    </svg>`;
+  mapEl.appendChild(markerEl);
+}
+function placeMarker(lat, lon) {
+  if (!markerEl) createMarker();
+  markerEl.dataset.lat = lat; markerEl.dataset.lon = lon;
+  const centerPx = latLonToPixel(center.lat, center.lon, zoom);
+  const ptPx = latLonToPixel(lat, lon, zoom);
+  const w = mapEl.clientWidth, h = mapEl.clientHeight;
+  const x = ptPx.x - centerPx.x + w/2 - offset.x;
+  const y = ptPx.y - centerPx.y + h/2 - offset.y;
+  markerEl.style.left = x + 'px';
+  markerEl.style.top  = y + 'px';
+}
+
+// --- GeoJSON loading ---
+async function loadIndianaBoundary() {
+  setLoading(true, 'loading boundary…');
+  try {
+    const res = await fetch(INDIANA_GEOJSON_URL);
+    if (!res.ok) throw new Error('boundary fetch failed');
+    const geo = await res.json();
+    // expect FeatureCollection - grab geometry
+    if (geo.type === 'FeatureCollection' && geo.features && geo.features.length) {
+      indianaPolygon = geo.features[0].geometry;
+      setLoading(false);
+      // optionally fit view
+      fitIndiana();
+    } else {
+      throw new Error('unexpected geojson format');
+    }
+  } catch (err) {
+    setLoading(true, 'boundary failed to load — check console');
+    console.error(err);
+  }
+}
+
+// --- Point-in-polygon (ray-casting) ---
+// polygon can be [ [ [lon,lat], ... ] ] (GeoJSON Polygon) or array of polygons (MultiPolygon)
+function pointInGeo( lat, lon, geometry ) {
+  // geometry: GeoJSON Polygon or MultiPolygon
+  if (!geometry) return false;
+  if (geometry.type === 'Polygon') return polygonContains(geometry.coordinates, [lon,lat]);
+  if (geometry.type === 'MultiPolygon') {
+    for (const poly of geometry.coordinates) {
+      if (polygonContains(poly, [lon,lat])) return true;
+    }
+    return false;
+  }
+  return false;
+}
+function polygonContains(rings, pt) {
+  // rings: array of linear rings; outer ring then holes
+  // We test outer ring and ensure not in holes
+  const outer = rings[0];
+  if (!rayCast(outer, pt)) return false;
+  // if in any hole, false
+  for (let i=1;i<rings.length;i++) {
+    if (rayCast(rings[i], pt)) return false;
+  }
+  return true;
+}
+function rayCast(coords, pt) {
+  // coords: array of [lon,lat]
+  const x = pt[0], y = pt[1];
+  let inside = false;
+  for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+    const xi = coords[i][0], yi = coords[i][1];
+    const xj = coords[j][0], yj = coords[j][1];
+    const intersect = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi + 0.0) + xi);
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+// --- Random point inside Indiana via rejection within bbox ---
+function getIndianaBBox() {
+  // compute bbox from indianaPolygon coordinates
+  if (!indianaPolygon) return null;
+  let minX=180,minY=90,maxX=-180,maxY=-90;
+  const processRing = coords => {
+    for (const c of coords) {
+      const lon=c[0], lat=c[1];
+      if (lon<minX) minX=lon; if (lon>maxX) maxX=lon;
+      if (lat<minY) minY=lat; if (lat>maxY) maxY=lat;
+    }
+  };
+  if (indianaPolygon.type==='Polygon') {
+    for (const r of indianaPolygon.coordinates) processRing(r);
+  } else if (indianaPolygon.type==='MultiPolygon') {
+    for (const poly of indianaPolygon.coordinates) for (const r of poly) processRing(r);
+  }
+  return { minLon:minX, minLat:minY, maxLon:maxX, maxLat:maxY };
+}
+function randomInRange(a,b){ return a + Math.random()*(b-a); }
+function randomPointInIndiana() {
+  const bbox = getIndianaBBox();
+  if (!bbox) throw new Error('Indiana boundary not loaded');
+  for (let i=0;i<MAX_REJECTION_ATTEMPTS;i++) {
+    const lat = randomInRange(bbox.minLat, bbox.maxLat);
+    const lon = randomInRange(bbox.minLon, bbox.maxLon);
+    if (pointInGeo(lat, lon, indianaPolygon)) return {lat, lon};
+  }
+  return null; // failure
+}
+
+// --- UI actions ---
+document.getElementById('randBtn').addEventListener('click', () => {
+  if (!indianaPolygon) { alert('Indiana boundary still loading'); return; }
+  setLoading(true, 'finding random point…');
+  setTimeout(() => { // allow UI update
+    const p = randomPointInIndiana();
+    setLoading(false);
+    if (!p) { alert('Failed to find a point — try again'); return; }
+    placeMarker(p.lat, p.lon);
+    // center on it
+    center.lat = p.lat; center.lon = p.lon;
+    offset.x = 0; offset.y = 0;
+    zoom = Math.max(7, Math.round(zoom)); // keep zoom reasonable
+    renderTiles();
+  }, 50);
+});
+document.getElementById('fitBtn').addEventListener('click', fitIndiana);
+
+function fitIndiana() {
+  if (!indianaPolygon) return;
+  // compute bbox and set center/zoom to fit
+  const bbox = getIndianaBBox();
+  const centerLat = (bbox.minLat + bbox.maxLat)/2;
+  const centerLon = (bbox.minLon + bbox.maxLon)/2;
+  center.lat = centerLat; center.lon = centerLon;
+  offset.x = 0; offset.y = 0;
+  // pick zoom by checking required tile span to cover bbox
+  const w = mapEl.clientWidth, h = mapEl.clientHeight;
+  for (let z=1; z<=18; z++) {
+    const p1 = latLonToPixel(bbox.maxLat, bbox.minLon, z);
+    const p2 = latLonToPixel(bbox.minLat, bbox.maxLon, z);
+    const spanX = Math.abs(p2.x - p1.x), spanY = Math.abs(p2.y - p1.y);
+    if (spanX <= w*0.9 && spanY <= h*0.9) { zoom = z; break; }
+  }
+  renderTiles();
+}
+
+// initial setup
+loadIndianaBoundary().then(()=>{ renderTiles(); });
+
+</script>
+</body>
+</html>
